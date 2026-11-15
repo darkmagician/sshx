@@ -40,17 +40,37 @@ pub struct Terminal {
     winsize: (u16, u16),
 }
 
+/// Builds the command used to spawn the shell, inheriting the parent environment.
+///
+/// `conpty::Process::spawn` replaces the child's environment with the variables
+/// explicitly set on the `Command`, rather than merging them into the inherited
+/// environment. Copy the parent environment up front so that the shell still sees
+/// variables like `PATH`.
+fn build_command(shell: &str) -> Command {
+    let mut command = Command::new(shell);
+
+    for (key, value) in std::env::vars_os() {
+        // Skip Windows drive current-directory pseudo-variables like `=C:`.
+        if !key.to_string_lossy().starts_with('=') {
+            command.env(key, value);
+        }
+    }
+
+    // Set terminal environment variables appropriately. These take precedence over
+    // anything inherited from the parent process.
+    command.env("TERM", "xterm-256color");
+    command.env("COLORTERM", "truecolor");
+    command.env("TERM_PROGRAM", "sshx");
+    command.env_remove("TERM_PROGRAM_VERSION");
+
+    command
+}
+
 impl Terminal {
     /// Create a new terminal, with attached PTY.
     #[instrument]
     pub async fn new(shell: &str) -> Result<Terminal> {
-        let mut command = Command::new(shell);
-
-        // Set terminal environment variables appropriately.
-        command.env("TERM", "xterm-256color");
-        command.env("COLORTERM", "truecolor");
-        command.env("TERM_PROGRAM", "sshx");
-        command.env_remove("TERM_PROGRAM_VERSION");
+        let command = build_command(shell);
 
         let mut child =
             tokio::task::spawn_blocking(move || conpty::Process::spawn(command)).await??;
@@ -115,5 +135,28 @@ impl PinnedDrop for Terminal {
     fn drop(self: Pin<&mut Self>) {
         let this = self.project();
         this.child.exit(0).ok();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsStr;
+
+    use super::*;
+
+    #[test]
+    fn command_inherits_parent_environment() {
+        let command = build_command("cmd.exe");
+        let envs: Vec<_> = command.get_envs().collect();
+
+        assert!(envs
+            .iter()
+            .any(|(key, value)| key.eq_ignore_ascii_case("PATH") && value.is_some()));
+        assert!(envs.iter().any(|(key, value)| {
+            key.eq_ignore_ascii_case("TERM") && *value == Some(OsStr::new("xterm-256color"))
+        }));
+        assert!(!envs.iter().any(|(key, value)| {
+            key.eq_ignore_ascii_case("TERM_PROGRAM_VERSION") && value.is_some()
+        }));
     }
 }
