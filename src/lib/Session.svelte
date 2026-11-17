@@ -125,6 +125,23 @@
     window.visualViewport?.addEventListener("resize", onViewportResize);
     window.visualViewport?.addEventListener("scroll", onViewportResize);
 
+    // The keyboard can open/close without a reliable visualViewport event on
+    // some mobile browsers. Re-measure shortly after focus changes as well.
+    const onFocusChange = debounce(() => {
+      if (mobile) scheduleFit(false);
+    }, 350);
+    document.addEventListener("focusin", onFocusChange);
+    document.addEventListener("focusout", onFocusChange);
+
+    const onPageShow = () => {
+      if (mobile) scheduleFit(false);
+    };
+    const onVisibilityChange = () => {
+      if (mobile && document.visibilityState === "visible") scheduleFit(false);
+    };
+    window.addEventListener("pageshow", onPageShow);
+    document.addEventListener("visibilitychange", onVisibilityChange);
+
     // Refit when the top bar changes height (status banner, network info, ...).
     const headerObserver = new ResizeObserver(() => {
       if (mobile) scheduleFit(false);
@@ -139,6 +156,10 @@
       window.removeEventListener("orientationchange", onViewportResize);
       window.visualViewport?.removeEventListener("resize", onViewportResize);
       window.visualViewport?.removeEventListener("scroll", onViewportResize);
+      document.removeEventListener("focusin", onFocusChange);
+      document.removeEventListener("focusout", onFocusChange);
+      window.removeEventListener("pageshow", onPageShow);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
       headerObserver.disconnect();
     };
   });
@@ -166,16 +187,33 @@
     }
   }
 
+  /** Whether a text input (the terminal's hidden textarea, chat, settings) is focused. */
+  function isTextInputFocused() {
+    const el = document.activeElement;
+    return (
+      el instanceof HTMLElement &&
+      (el.classList.contains("xterm-helper-textarea") ||
+        el.tagName === "INPUT" ||
+        el.tagName === "TEXTAREA" ||
+        el.isContentEditable)
+    );
+  }
+
   /**
    * The visible area available to the active terminal, accounting for the top
-   * bar, the home indicator, and the soft keyboard (via visualViewport).
+   * bar, the home indicator, and the soft keyboard.
+   *
+   * The visual viewport is only trusted while a text input is focused: some
+   * mobile browsers keep reporting a keyboard-sized viewport after the
+   * keyboard closes, which would otherwise leave the terminal half-height.
    */
   function getMobileRegion() {
     const vv = window.visualViewport;
-    const offsetLeft = vv?.offsetLeft ?? 0;
-    const offsetTop = vv?.offsetTop ?? 0;
-    const vw = vv?.width ?? window.innerWidth;
-    const vh = vv?.height ?? window.innerHeight;
+    const useVisual = vv !== null && isTextInputFocused();
+    const offsetLeft = useVisual ? vv.offsetLeft : 0;
+    const offsetTop = useVisual ? vv.offsetTop : 0;
+    const vw = useVisual ? vv.width : window.innerWidth;
+    const vh = useVisual ? vv.height : window.innerHeight;
     const headerBottom = headerEl?.getBoundingClientRect().bottom ?? 0;
     return {
       left: offsetLeft + MOBILE_FIT_PADDING,
@@ -187,8 +225,9 @@
 
   /**
    * Compute terminal dimensions that make the active terminal fill the mobile
-   * viewport. Cell metrics are derived from the live xterm screen, which is
-   * unaffected by the canvas transform.
+   * viewport. Cell metrics come from xterm's own hidden measure element, whose
+   * layout size is unaffected by the canvas transform and does not depend on
+   * the terminal's current rows/columns.
    */
   function computeMobileTarget(id: number) {
     const entry = shells.find(([sid]) => sid === id);
@@ -199,14 +238,32 @@
     const screenEl = termEl.querySelector(
       ".xterm-screen",
     ) as HTMLElement | null;
-    if (!screenEl || !ws.cols || !ws.rows) return null;
+    if (!screenEl) return null;
 
     const screenW = screenEl.offsetWidth;
     const screenH = screenEl.offsetHeight;
     if (screenW < 10 || screenH < 10) return null;
 
-    const cellW = screenW / ws.cols;
-    const cellH = screenH / ws.rows;
+    // Ask xterm for its exact rendered cell size. This is based on the
+    // terminal's current cols/rows rather than the possibly-stale prop, so it
+    // remains correct while a resize is in flight.
+    const cell = termHandles[id]?.getCellSize?.() as {
+      width: number;
+      height: number;
+    } | null;
+    let cellW: number;
+    let cellH: number;
+    if (cell) {
+      cellW = cell.width;
+      cellH = cell.height;
+    } else if (ws.cols && ws.rows) {
+      cellW = screenW / ws.cols;
+      cellH = screenH / ws.rows;
+    } else {
+      return null;
+    }
+    if (cellW <= 0 || cellH <= 0) return null;
+
     const chromeW = wrapper.offsetWidth - screenW;
     const chromeH = wrapper.offsetHeight - screenH;
     const region = getMobileRegion();
@@ -373,6 +430,7 @@
   const writers: Record<number, (data: string) => void> = {};
   const termWrappers: Record<number, HTMLDivElement> = {};
   const termElements: Record<number, HTMLDivElement> = {};
+  const termHandles: Record<number, any> = {};
   const chunknums: Record<number, number> = {};
   const locks: Record<number, any> = {};
   let userId = 0;
@@ -924,6 +982,7 @@
           {mobile}
           rows={ws.rows}
           cols={ws.cols}
+          bind:this={termHandles[id]}
           bind:write={writers[id]}
           bind:termEl={termElements[id]}
           on:titleChange={({ detail }) =>

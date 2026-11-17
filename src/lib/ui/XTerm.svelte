@@ -69,6 +69,21 @@
   /** Whether this terminal is shown in the mobile single-session layout. */
   export let mobile = false;
 
+  /**
+   * Exact rendered size of one character cell, in CSS pixels. Uses xterm's own
+   * current cols/rows, so it stays correct even while a resize is in flight.
+   */
+  export function getCellSize(): { width: number; height: number } | null {
+    if (!term || !term.cols || !term.rows) return null;
+    const screenEl = term.element?.querySelector(
+      ".xterm-screen",
+    ) as HTMLElement | null;
+    if (!screenEl) return null;
+    const width = screenEl.offsetWidth / term.cols;
+    const height = screenEl.offsetHeight / term.rows;
+    return width > 0 && height > 0 ? { width, height } : null;
+  }
+
   export let termEl: HTMLDivElement = null as any; // suppress "missing prop" warning
   let term: Terminal | null = null;
 
