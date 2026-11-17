@@ -135,7 +135,7 @@ Group=sshx
 
 # 关键:工作目录必须包含 build/
 WorkingDirectory=/opt/sshx
-ExecStart=/opt/sshx/sshx-server --listen 192.168.1.199 --port 8051
+ExecStart=/opt/sshx/sshx-server --listen 192.168.1.199 --port 8051 --override-origin https://192.168.1.199:8443
 
 EnvironmentFile=/etc/sshx/sshx.env
 
@@ -156,6 +156,8 @@ WantedBy=multi-user.target
 说明:
 
 - `--listen 192.168.1.199`:允许其他机器上的命令行客户端直连 gRPC。若客户端只在服务器本机运行,可改为 `--listen 127.0.0.1`,并把 Nginx 的 `proxy_pass` 改为 `http://127.0.0.1:8051`(此时代理端口不再对外暴露)。
+- `--override-origin`:决定服务端 `Open` RPC 返回的网页 URL(`crates/sshx-server/src/grpc.rs:47,66`)。使用域名证书时改为 `--override-origin https://sshx.example.com`;末尾不要加斜杠。
+- `--host` **不是**公网地址,不要填 Nginx 反代地址。它仅用于多节点 Redis mesh 的节点标识(记录会话 owner),单机部署无需设置;多节点时应填该节点的唯一内网地址,例如 `node1.internal:8051`。
 - 不要省略 `WorkingDirectory`,否则网页 404。
 - 默认端口为 8051,可用 `--port` 修改。
 
@@ -289,13 +291,11 @@ ss -ltn | grep -E ':(8051|8443)\b'
 
 ## 8. 客户端连接
 
-客户端不需要修改代码,但必须通过 `--override-origin` 让服务端生成 HTTPS 网页链接:
+客户端不需要修改代码,也**没有 `--override-origin` 参数**(该参数属于服务端)。网页链接由服务端的 `--override-origin` 决定(优先级高于客户端传来的 origin),客户端只需指定 gRPC 后端地址:
 
 ```bash
 cd /root/sshx
-./target/release/sshx \
-  --server http://192.168.1.199:8051 \
-  --override-origin https://192.168.1.199:8443
+./target/release/sshx --server http://192.168.1.199:8051
 ```
 
 打印出的链接形如:
@@ -308,8 +308,8 @@ https://192.168.1.199:8443/s/<id>#<key>
 
 注意:
 
-- `--server` 必须是后端根地址,用于 gRPC 连接与断线重连,不能写成 HTTPS 反代地址(自签证书会被 tonic 的 webpki 根证书校验拒绝)。
-- `--override-origin` 末尾不要加斜杠。
+- `--server` 必须是后端根地址,用于 gRPC 连接与断线重连。不要写成 HTTPS 反代地址:自签证书会被 tonic 的 webpki 根证书校验拒绝(`crates/sshx/src/controller.rs:119`)。
+- 若使用**公共 CA 签发**的域名证书(如 Let's Encrypt),CLI 也可以直接连接 `--server https://sshx.example.com`。此时 origin 本身就是 HTTPS 域名,可不设置 `--override-origin`。但需要 Nginx 为 CLI 提供 gRPC 入口(`grpc_pass`,客户端到 Nginx 使用 HTTP/2),并建议与浏览器入口分开端口或子域名,因为 nginx 1.14 的 HTTP/2 不支持 WebSocket 升级。
 
 ## 9. 升级
 
