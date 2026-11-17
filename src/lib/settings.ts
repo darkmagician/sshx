@@ -6,6 +6,8 @@ export type Settings = {
   name: string;
   theme: ThemeName;
   scrollback: number;
+  /** Manual row count for the mobile layout; 0 means "fit to screen". */
+  mobileRows: number;
 };
 
 const storedSettings = persisted<Partial<Settings>>("sshx-settings-store", {});
@@ -27,10 +29,20 @@ export const settings: Readable<Settings> = derived(
       scrollback = 5000;
     }
 
+    let mobileRows = $storedSettings.mobileRows;
+    if (
+      typeof mobileRows !== "number" ||
+      !Number.isFinite(mobileRows) ||
+      mobileRows < 0
+    ) {
+      mobileRows = 0;
+    }
+
     return {
       name,
       theme,
       scrollback,
+      mobileRows: Math.floor(mobileRows),
     };
   },
 );

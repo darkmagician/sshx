@@ -69,21 +69,6 @@
   /** Whether this terminal is shown in the mobile single-session layout. */
   export let mobile = false;
 
-  /**
-   * Exact rendered size of one character cell, in CSS pixels. Uses xterm's own
-   * current cols/rows, so it stays correct even while a resize is in flight.
-   */
-  export function getCellSize(): { width: number; height: number } | null {
-    if (!term || !term.cols || !term.rows) return null;
-    const screenEl = term.element?.querySelector(
-      ".xterm-screen",
-    ) as HTMLElement | null;
-    if (!screenEl) return null;
-    const width = screenEl.offsetWidth / term.cols;
-    const height = screenEl.offsetHeight / term.rows;
-    return width > 0 && height > 0 ? { width, height } : null;
-  }
-
   export let termEl: HTMLDivElement = null as any; // suppress "missing prop" warning
   let term: Terminal | null = null;
 
@@ -242,6 +227,7 @@
 <div
   class="term-container"
   class:focused
+  class:mobile
   style:background={theme.background}
   on:mousedown={() => !mobile && dispatch("bringToFront")}
   on:pointerdown={(event) => event.stopPropagation()}
@@ -280,7 +266,9 @@
     </div>
   {/if}
   <div
-    class="inline-block px-4 py-2 transition-opacity duration-500"
+    class="inline-block transition-opacity duration-500 {mobile
+      ? 'px-1 py-1'
+      : 'px-4 py-2'}"
     bind:this={termEl}
     style:opacity={loaded ? 1.0 : 0.0}
     on:wheel={(event) => {
@@ -297,6 +285,11 @@
   .term-container {
     @apply inline-block rounded-lg border border-zinc-700 opacity-90;
     transition: transform 200ms, opacity 200ms;
+  }
+
+  /* Mobile is a full-page terminal: no outer chrome or margins. */
+  .term-container.mobile {
+    @apply rounded-none border-0 opacity-100;
   }
 
   .term-container:not(.focused) :global(.xterm) {

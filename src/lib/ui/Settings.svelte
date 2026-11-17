@@ -10,6 +10,7 @@
   let inputName: string;
   let inputTheme: ThemeName;
   let inputScrollback: number;
+  let inputMobileRows: number;
 
   let initialized = false;
   $: open, (initialized = false);
@@ -18,6 +19,7 @@
     inputName = $settings.name;
     inputTheme = $settings.theme;
     inputScrollback = $settings.scrollback;
+    inputMobileRows = $settings.mobileRows;
   }
 </script>
 
@@ -86,6 +88,30 @@
             }
           }}
           step="100"
+        />
+      </div>
+    </div>
+    <div class="item">
+      <div>
+        <p class="item-title">Mobile terminal rows</p>
+        <p class="item-subtitle">
+          Rows shown on phones. 0 fits the screen automatically; larger values
+          show more lines (text scales down to fit).
+        </p>
+      </div>
+      <div>
+        <input
+          type="number"
+          class="input-common"
+          min="0"
+          max="300"
+          step="1"
+          bind:value={inputMobileRows}
+          on:input={() => {
+            if (inputMobileRows >= 0) {
+              updateSettings({ mobileRows: inputMobileRows });
+            }
+          }}
         />
       </div>
     </div>
