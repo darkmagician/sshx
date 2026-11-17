@@ -447,7 +447,14 @@ https://192.168.1.199:8443/s/<id>#<key>
 cd /root/sshx
 git pull                 # 如需更新源码
 ./build_server.sh
+sudo ./deploy_server.sh  # 复制到 /opt/sshx 并重启服务
+```
 
+`deploy_server.sh` 会先写临时文件再原子替换二进制与 `build/`,然后重启 systemd 服务;加 `--no-restart` 可只复制文件。目标目录与服务名可通过 `DEST_DIR`、`SERVICE` 环境变量覆盖。
+
+等价的完整手动步骤:
+
+```bash
 sudo systemctl stop sshx
 sudo install -m 755 dist/sshx-server /opt/sshx/sshx-server
 sudo rm -rf /opt/sshx/build
