@@ -214,8 +214,9 @@ server {
     ssl_certificate_key /etc/nginx/ssl/sshx.key;
     ssl_protocols       TLSv1.2 TLSv1.3;
 
-    # 注意:不要在此 vhost 开启 http2,
-    # nginx 1.14 的 HTTP/2 不支持 WebSocket 升级。
+    # 仅浏览器入口:不要在此 vhost 开启 http2。
+    # nginx < 1.25.1 的 HTTP/2 不支持 WebSocket 升级;
+    # 若要让命令行客户端也经过 Nginx,见 6.4。
 
     location / {
         # 与 systemd 中 --listen 的地址保持一致
@@ -239,6 +240,8 @@ server {
 }
 ```
 
+> 也可以使用公共 CA 签发的域名证书:把 `listen`、`server_name`、证书路径换成实际值,并在服务端把 `--override-origin` 改成对应的 HTTPS 地址。若还要让命令行客户端经过 Nginx,见 6.4。
+
 ### 6.3 校验并应用
 
 ```bash
@@ -260,6 +263,115 @@ sudo restorecon -Rv /etc/nginx/ssl
 sudo firewall-cmd --permanent --add-port=8443/tcp
 sudo firewall-cmd --reload
 ```
+
+### 6.4 可选:让命令行客户端也经过 Nginx
+
+6.2 的配置只代理浏览器(HTTP/1.1 + WebSocket)。命令行客户端使用 gRPC,而 gRPC **要求端到端 HTTP/2**。如果客户端也指向 Nginx,必须使用 `grpc_pass`,不能用 `proxy_pass`。否则会出现:
+
+- TLS 握手阶段报 `no_application_protocol`:Nginx 未通过 ALPN 协商出 `h2`
+- 连接后约 60 秒报 `h2 protocol error` 并反复 `disconnected, retrying...`:gRPC 被降级成 HTTP/1.1,或 `grpc_read_timeout` 使用了默认的 60 秒
+
+前提条件:
+
+- Nginx 编译时包含 `grpc` 模块(发行版默认包含)
+- 客户端与 Nginx 之间协商 HTTP/2(`listen ... http2`)
+- 证书由**公共 CA** 签发(tonic 只信任 webpki 公共根证书);自签证书只能直连后端
+
+#### 方式一:浏览器与 gRPC 共用同一 vhost
+
+```nginx
+server {
+    listen 8443 ssl http2;          # nginx < 1.25.1 的写法
+    # nginx 1.25.1+ 改为:listen 8443 ssl; 并单独写一行 http2 on;
+    server_name sshx.example.com;
+
+    ssl_certificate     /etc/nginx/ssl/sshx.example.com.crt;
+    ssl_certificate_key /etc/nginx/ssl/sshx.example.com.key;
+
+    # gRPC:命令行客户端(路径形如 /sshx.SshxService/Open)
+    location ~ ^/(sshx\.SshxService|grpc\.reflection\.)/ {
+        grpc_pass grpc://backend.internal:8051;
+        grpc_set_header Host $host;
+        grpc_read_timeout 3600s;
+        grpc_send_timeout 3600s;
+        grpc_socket_keepalive on;
+    }
+
+    # 浏览器:SPA 静态资源 + WebSocket
+    location / {
+        proxy_pass http://backend.internal:8051;
+        proxy_http_version 1.1;
+
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        proxy_set_header Upgrade    $http_upgrade;
+        proxy_set_header Connection "upgrade";
+
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_buffering    off;
+    }
+}
+```
+
+> nginx < 1.25.1 不支持 WebSocket over HTTP/2(RFC 8441)。如果浏览器页面能打开但终端连不上,改用方式二。
+
+#### 方式二:网页与 gRPC 分开端口(兼容性最好)
+
+- 网页入口:`listen 8443 ssl;`(不开启 http2),使用 `proxy_pass` 反代
+- gRPC 入口:`listen 8444 ssl http2;`,只保留上面的 `grpc_pass` location
+
+两个入口可以复用同一张证书,客户端分别指向对应端口。
+
+#### 后端地址使用变量(应对 IP / 域名变化)
+
+`grpc_pass` 支持变量,但使用变量时必须配置 `resolver`;Nginx 在请求时解析域名,并按 `valid` 缓存:
+
+```nginx
+resolver 192.0.2.53 valid=10s ipv6=off;   # 替换为实际 DNS 地址
+resolver_timeout 3s;
+
+set $sshx_grpc "backend.internal:8051";
+
+location ~ ^/(sshx\.SshxService|grpc\.reflection\.)/ {
+    grpc_pass grpc://$sshx_grpc;
+    grpc_read_timeout 3600s;
+    grpc_send_timeout 3600s;
+}
+```
+
+注意:
+
+- Nginx 的 `resolver` **不读取 `/etc/hosts`**,域名必须有真实 DNS 记录
+- 变量方式不会复用 upstream 连接池;对 gRPC 长连接影响有限
+- nginx ≥ 1.27.3 可使用 upstream 的 `resolve` 参数,同时保留连接池:
+
+```nginx
+upstream sshx_backend {
+    zone sshx_backend 64k;
+    server backend.internal:8051 resolve;
+    resolver 192.0.2.53 valid=10s;
+}
+
+location ~ ^/(sshx\.SshxService|grpc\.reflection\.)/ {
+    grpc_pass grpc://sshx_backend;
+    grpc_read_timeout 3600s;
+    grpc_send_timeout 3600s;
+}
+```
+
+#### 客户端命令
+
+完成上述 gRPC 入口配置后:
+
+```bash
+./target/release/sshx --server https://sshx.example.com:8443
+```
+
+服务端的 `--override-origin` 建议仍显式设置为同一个 HTTPS 地址,这样所有客户端生成的网页链接保持一致。
 
 ## 7. 验证
 
@@ -291,7 +403,9 @@ ss -ltn | grep -E ':(8051|8443)\b'
 
 ## 8. 客户端连接
 
-客户端不需要修改代码,也**没有 `--override-origin` 参数**(该参数属于服务端)。网页链接由服务端的 `--override-origin` 决定(优先级高于客户端传来的 origin),客户端只需指定 gRPC 后端地址:
+客户端不需要修改代码,也**没有 `--override-origin` 参数**(该参数属于服务端)。网页链接由服务端的 `--override-origin` 决定(优先级高于客户端传来的 origin)。
+
+### 8.1 推荐:直连后端
 
 ```bash
 cd /root/sshx
@@ -308,8 +422,24 @@ https://192.168.1.199:8443/s/<id>#<key>
 
 注意:
 
-- `--server` 必须是后端根地址,用于 gRPC 连接与断线重连。不要写成 HTTPS 反代地址:自签证书会被 tonic 的 webpki 根证书校验拒绝(`crates/sshx/src/controller.rs:119`)。
-- 若使用**公共 CA 签发**的域名证书(如 Let's Encrypt),CLI 也可以直接连接 `--server https://sshx.example.com`。此时 origin 本身就是 HTTPS 域名,可不设置 `--override-origin`。但需要 Nginx 为 CLI 提供 gRPC 入口(`grpc_pass`,客户端到 Nginx 使用 HTTP/2),并建议与浏览器入口分开端口或子域名,因为 nginx 1.14 的 HTTP/2 不支持 WebSocket 升级。
+- `--server` 是 gRPC 后端根地址,用于连接与断线重连。
+- 使用自签证书时必须直连 HTTP:tonic 使用 webpki 公共根证书,自签证书会导致握手失败(`crates/sshx/src/controller.rs:119`)。
+- 服务端 `--override-origin` 末尾不要加斜杠。
+
+### 8.2 可选:经 Nginx(公共 CA 证书 + grpc_pass)
+
+完成 [6.4](#64-可选让命令行客户端也经过-nginx) 的 `grpc_pass` 配置后,客户端可以直接使用 HTTPS 域名:
+
+```bash
+./target/release/sshx --server https://sshx.example.com:8443
+```
+
+要求:
+
+- Nginx 通过 ALPN 协商出 `h2`,否则报 `no_application_protocol`
+- 使用 `grpc_pass` 而不是 `proxy_pass`,否则连接约 60 秒后报 `h2 protocol error`
+- `grpc_read_timeout` / `grpc_send_timeout` 已调大
+- 证书由公共 CA 签发
 
 ## 9. 升级
 
@@ -335,7 +465,10 @@ sudo systemctl start sshx
 | 浏览器报 `crypto.subtle` / `importKey` 未定义 | 通过 HTTP 访问,不是安全上下文 | 使用 `https://` 访问;`http://localhost` 也可 |
 | Nginx 返回 502 | Nginx 连不到后端 | 检查 `--listen` 与 `proxy_pass` 地址是否一致;`ss -ltn` 查看端口;SELinux 是否允许 `httpd_can_network_connect` |
 | Nginx 返回 503 | 请求被上游代理/错误地址拦截 | 检查浏览器或 curl 是否走了系统代理 |
-| 终端连接几秒后断开 | 代理超时 | 确认 `proxy_read_timeout` 已加长,且未开启 http2 |
+| 终端连接几秒后断开 | 代理超时 | 确认 `proxy_read_timeout` 已加长,且网页入口未开启 http2 |
+| 客户端报 `no_application_protocol` | Nginx 未通过 ALPN 协商出 `h2` | 为 gRPC 入口开启 `http2`;或让客户端直连后端 |
+| 客户端连接约 60 秒后报 `h2 protocol error` 并重连 | 用 `proxy_pass` 承载了 gRPC,或使用默认 60 秒超时 | 改用 `grpc_pass`,并设置 `grpc_read_timeout` / `grpc_send_timeout` |
+| 浏览器页面能打开但终端连不上 | nginx < 1.25.1 的 HTTP/2 不支持 WebSocket 升级 | 按 6.4 方式二把网页与 gRPC 分开端口,vhost 不要共用 http2 |
 | 重启后旧链接全部失效 | `SSHX_SECRET` 未固定,或使用内存存储 | 配置 `/etc/sshx/sshx.env`;多节点/持久化需 Redis |
 | 证书警告 | 自签证书 | 浏览器手动信任,或导入证书到系统信任库 |
 
