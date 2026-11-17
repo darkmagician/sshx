@@ -85,6 +85,21 @@
   let lastFitKey = "";
   let lastFitActiveId: number | null = null;
 
+  // Keyboard-aware panning/scrollbar state for the mobile layout.
+  let keyboardOpen = false;
+  let mobileScrollTop = 0;
+  let lastScrollActiveId: number | null = null;
+  let scrollInfo = {
+    visible: false,
+    visibleTop: 0,
+    visibleHeight: 0,
+    maxScroll: 0,
+    thumbHeight: 0,
+    thumbOffset: 0,
+  };
+  let baselineWidth = 0;
+  let baselineHeight = 0;
+
   onMount(() => {
     touchZoom = new TouchZoom(fabricEl);
     touchZoom.onMove((manual) => {
@@ -93,6 +108,11 @@
 
       // Programmatic fits must not disturb an active terminal or hide panels.
       if (!manual) return;
+
+      // Keep the scrollbar in sync when the user pans/pinches the terminal.
+      if (mobile && keyboardOpen) {
+        syncScrollFromCamera();
+      }
 
       // Blur if the user is currently focused on a terminal.
       //
@@ -144,8 +164,25 @@
     };
   });
 
+  function resetScrollState() {
+    keyboardOpen = false;
+    mobileScrollTop = 0;
+    lastScrollActiveId = null;
+    baselineWidth = 0;
+    baselineHeight = 0;
+    scrollInfo = {
+      visible: false,
+      visibleTop: 0,
+      visibleHeight: 0,
+      maxScroll: 0,
+      thumbHeight: 0,
+      thumbOffset: 0,
+    };
+  }
+
   function setMobile(next: boolean) {
     if (next === mobile || !touchZoom) return;
+    resetScrollState();
     if (next) {
       desktopView = { center: [...center], zoom };
       if (activeId === null && shells.length) {
@@ -168,21 +205,33 @@
   }
 
   /**
-   * The visible area available to the active terminal, accounting for the top
-   * bar, the home indicator, and the soft keyboard (via visualViewport).
+   * The largest visual-viewport height seen at the current width. This is the
+   * height available without a soft keyboard, so the terminal grid does not
+   * change when the keyboard opens.
+   */
+  function getKeyboardFreeHeight() {
+    const width = window.innerWidth;
+    const height = window.visualViewport?.height ?? window.innerHeight;
+    if (width !== baselineWidth) {
+      baselineWidth = width;
+      baselineHeight = height;
+    } else if (height > baselineHeight) {
+      baselineHeight = height;
+    }
+    return baselineHeight;
+  }
+
+  /**
+   * Layout area used for sizing the terminal: full width and the keyboard-free
+   * height below the top bar. The keyboard never changes this region.
    */
   function getMobileRegion() {
-    const vv = window.visualViewport;
-    const offsetLeft = vv?.offsetLeft ?? 0;
-    const offsetTop = vv?.offsetTop ?? 0;
-    const vw = vv?.width ?? window.innerWidth;
-    const vh = vv?.height ?? window.innerHeight;
     const headerBottom = headerEl?.getBoundingClientRect().bottom ?? 0;
     return {
-      left: offsetLeft + MOBILE_FIT_PADDING,
-      right: offsetLeft + vw - MOBILE_FIT_PADDING,
-      top: Math.max(headerBottom, offsetTop) + MOBILE_FIT_PADDING,
-      bottom: offsetTop + vh - safeAreaBottom - MOBILE_FIT_PADDING,
+      left: MOBILE_FIT_PADDING,
+      right: window.innerWidth - MOBILE_FIT_PADDING,
+      top: headerBottom + MOBILE_FIT_PADDING,
+      bottom: getKeyboardFreeHeight() - safeAreaBottom - MOBILE_FIT_PADDING,
     };
   }
 
@@ -267,6 +316,46 @@
     }, 150);
   }
 
+  /**
+   * Scroll position that keeps the terminal cursor just above the keyboard.
+   */
+  function getCursorScrollTop(
+    id: number,
+    ws: WsWinsize,
+    wrapper: HTMLDivElement,
+    termHeight: number,
+    fittedZoom: number,
+    visibleTop: number,
+    visibleBottom: number,
+    visibleHeight: number,
+    maxScroll: number,
+  ) {
+    if (maxScroll <= 0) return 0;
+    const row = termHandles[id]?.getCursorRow?.();
+    const termEl = termElements[id];
+    const screenEl = termEl?.querySelector(
+      ".xterm-screen",
+    ) as HTMLElement | null;
+    if (
+      typeof row !== "number" ||
+      !Number.isFinite(row) ||
+      !screenEl ||
+      !ws.rows
+    ) {
+      return maxScroll;
+    }
+
+    const cellH = screenEl.offsetHeight / ws.rows;
+    const chromeH = wrapper.offsetHeight - screenEl.offsetHeight;
+    const cursorFromTop =
+      chromeH / 2 + Math.min(Math.max(row, 0), ws.rows - 1) * cellH;
+    const margin = Math.min(48, visibleHeight * 0.1);
+    const desiredTop = visibleBottom - margin - fittedZoom * cursorFromTop;
+    const centeredTop =
+      visibleTop + Math.max(0, (visibleHeight - termHeight) / 2);
+    return Math.min(Math.max(centeredTop - desiredTop, 0), maxScroll);
+  }
+
   /** Move and zoom the camera so the active terminal fits the viewport. */
   function fitActive(animated = false, forceReady = false) {
     if (!mobile || activeId === null || !touchZoom) return;
@@ -285,24 +374,80 @@
     if (width < 10 || height < 10) return;
 
     const region = getMobileRegion();
-    const availW = region.right - region.left;
-    const availH = region.bottom - region.top;
-    if (availW <= 0 || availH <= 0) return;
+    const regionW = region.right - region.left;
+    const regionH = region.bottom - region.top;
+    if (regionW <= 0 || regionH <= 0) return;
 
     const fittedZoom = Math.max(
       MOBILE_MIN_ZOOM,
-      Math.min(1, availW / width, availH / height),
+      Math.min(1, regionW / width, regionH / height),
     );
 
+    // The visible part of the screen. The keyboard covers the bottom, so the
+    // terminal is taller than the visible area; keep its font size/zoom and
+    // pan it upwards instead of resizing it.
+    const vv = window.visualViewport;
+    const vvTop = vv?.offsetTop ?? 0;
+    const vvBottom = vvTop + (vv?.height ?? window.innerHeight);
+    const visibleTop = Math.max(region.top, vvTop);
+    const visibleBottom = Math.min(region.bottom, vvBottom);
+    const visibleHeight = Math.max(0, visibleBottom - visibleTop);
+    const termHeight = height * fittedZoom;
+    const maxScroll = Math.max(0, termHeight - visibleHeight);
+
+    // A larger shrink than a browser toolbar means the soft keyboard is open.
+    const keyboardNow = regionH - visibleHeight > 120;
+    const keyboardChanged = keyboardNow !== keyboardOpen;
+
+    if (keyboardChanged || activeId !== lastScrollActiveId) {
+      keyboardOpen = keyboardNow;
+      lastScrollActiveId = activeId;
+      mobileScrollTop = keyboardNow
+        ? getCursorScrollTop(
+            activeId,
+            ws,
+            el,
+            termHeight,
+            fittedZoom,
+            visibleTop,
+            visibleBottom,
+            visibleHeight,
+            maxScroll,
+          )
+        : 0;
+    } else {
+      mobileScrollTop = Math.min(
+        Math.max(mobileScrollTop, 0),
+        keyboardNow ? maxScroll : 0,
+      );
+    }
+
+    const scroll = keyboardNow ? mobileScrollTop : 0;
+    const thumbHeight =
+      maxScroll > 0
+        ? Math.max(24, visibleHeight * (visibleHeight / termHeight))
+        : 0;
+    const thumbOffset =
+      maxScroll > 0 ? (scroll / maxScroll) * (visibleHeight - thumbHeight) : 0;
+    scrollInfo = {
+      visible: keyboardNow && maxScroll > 1,
+      visibleTop,
+      visibleHeight,
+      maxScroll,
+      thumbHeight,
+      thumbOffset,
+    };
+
     const [ox, oy] = getConstantOffset();
-    const cx = (region.left + region.right) / 2;
-    const cy = (region.top + region.bottom) / 2;
+    const left = region.left + Math.max(0, (regionW - width * fittedZoom) / 2);
+    const top =
+      visibleTop + Math.max(0, (visibleHeight - termHeight) / 2) - scroll;
     const nextCenter = [
-      ox + ws.x + width / 2 - cx / fittedZoom,
-      oy + ws.y + height / 2 - cy / fittedZoom,
+      ox + ws.x - left / fittedZoom,
+      oy + ws.y - top / fittedZoom,
     ];
 
-    if (animated) {
+    if (animated || keyboardChanged) {
       touchZoom.moveTo(nextCenter, fittedZoom);
     } else {
       touchZoom.setView(nextCenter, fittedZoom);
@@ -331,6 +476,51 @@
       // Reflow now that the terminal has real dimensions.
       scheduleFit(false);
     }
+  }
+
+  let scrollbarEl: HTMLDivElement;
+
+  /** Drag/click the mobile scrollbar to pan the active terminal vertically. */
+  function setMobileScrollFromPointer(event: PointerEvent) {
+    if (!scrollbarEl || !scrollInfo.visible) return;
+    const rect = scrollbarEl.getBoundingClientRect();
+    const usable = rect.height - scrollInfo.thumbHeight;
+    if (usable <= 0) return;
+    const y = event.clientY - rect.top - scrollInfo.thumbHeight / 2;
+    const fraction = Math.min(1, Math.max(0, y / usable));
+    mobileScrollTop = fraction * scrollInfo.maxScroll;
+    fitActive(false);
+  }
+
+  /** Keep the scrollbar thumb in sync after a manual pan or pinch. */
+  function syncScrollFromCamera() {
+    if (!mobile || !keyboardOpen || activeId === null) return;
+    const entry = shells.find(([sid]) => sid === activeId);
+    const el = termWrappers[activeId];
+    if (!entry || !el || scrollInfo.visibleHeight <= 0) return;
+
+    const termHeight = el.offsetHeight * zoom;
+    const maxScroll = Math.max(0, termHeight - scrollInfo.visibleHeight);
+    const [, oy] = getConstantOffset();
+    const screenTop = zoom * (entry[1].y - center[1] + oy);
+    mobileScrollTop = Math.min(
+      Math.max(scrollInfo.visibleTop - screenTop, 0),
+      maxScroll,
+    );
+
+    const thumbHeight =
+      maxScroll > 0
+        ? Math.max(
+            24,
+            scrollInfo.visibleHeight * (scrollInfo.visibleHeight / termHeight),
+          )
+        : 0;
+    const thumbOffset =
+      maxScroll > 0
+        ? (mobileScrollTop / maxScroll) *
+          (scrollInfo.visibleHeight - thumbHeight)
+        : 0;
+    scrollInfo = { ...scrollInfo, maxScroll, thumbHeight, thumbOffset };
   }
 
   function watchShellSize(node: HTMLElement) {
@@ -390,6 +580,7 @@
   const writers: Record<number, (data: string) => void> = {};
   const termWrappers: Record<number, HTMLDivElement> = {};
   const termElements: Record<number, HTMLDivElement> = {};
+  const termHandles: Record<number, any> = {};
   const chunknums: Record<number, number> = {};
   const locks: Record<number, any> = {};
   let userId = 0;
@@ -854,6 +1045,35 @@
     </div>
   {/if}
 
+  {#if mobile && scrollInfo.visible}
+    <div
+      class="mobile-scrollbar"
+      style:top="{scrollInfo.visibleTop}px"
+      style:height="{scrollInfo.visibleHeight}px"
+      bind:this={scrollbarEl}
+      on:pointerdown={(event) => {
+        event.preventDefault();
+        scrollbarEl.setPointerCapture(event.pointerId);
+        setMobileScrollFromPointer(event);
+      }}
+      on:pointermove={(event) => {
+        if (scrollbarEl.hasPointerCapture(event.pointerId)) {
+          setMobileScrollFromPointer(event);
+        }
+      }}
+      on:pointerup={(event) =>
+        scrollbarEl.releasePointerCapture(event.pointerId)}
+      on:pointercancel={(event) =>
+        scrollbarEl.releasePointerCapture(event.pointerId)}
+    >
+      <div
+        class="mobile-scrollbar-thumb"
+        style:top="{scrollInfo.thumbOffset}px"
+        style:height="{scrollInfo.thumbHeight}px"
+      />
+    </div>
+  {/if}
+
   {#if showChat}
     <div
       class="absolute flex flex-col justify-end pointer-events-none z-10 {mobile
@@ -941,6 +1161,7 @@
           {mobile}
           rows={ws.rows}
           cols={ws.cols}
+          bind:this={termHandles[id]}
           bind:write={writers[id]}
           bind:termEl={termElements[id]}
           on:titleChange={({ detail }) =>
@@ -1051,5 +1272,23 @@
   .measuring {
     transform: none !important;
     visibility: hidden !important;
+  }
+
+  /* Vertical scrollbar shown while the soft keyboard reduces the viewport. */
+  .mobile-scrollbar {
+    position: absolute;
+    right: 0;
+    z-index: 15;
+    width: 16px;
+    touch-action: none;
+    pointer-events: auto;
+  }
+
+  .mobile-scrollbar-thumb {
+    position: absolute;
+    right: 5px;
+    width: 5px;
+    border-radius: 9999px;
+    background: rgb(255 255 255 / 0.35);
   }
 </style>

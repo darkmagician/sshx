@@ -69,6 +69,11 @@
   /** Whether this terminal is shown in the mobile single-session layout. */
   export let mobile = false;
 
+  /** Row of the cursor within the visible terminal viewport (0-based). */
+  export function getCursorRow(): number | null {
+    return term?.buffer.active.cursorY ?? null;
+  }
+
   export let termEl: HTMLDivElement = null as any; // suppress "missing prop" warning
   let term: Terminal | null = null;
 
