@@ -24,8 +24,9 @@
   import XTerm from "./ui/XTerm.svelte";
   import Avatars from "./ui/Avatars.svelte";
   import LiveCursor from "./ui/LiveCursor.svelte";
+  import SessionTabs from "./ui/SessionTabs.svelte";
   import { slide } from "./action/slide";
-  import { TouchZoom, INITIAL_ZOOM } from "./action/touchZoom";
+  import { TouchZoom, INITIAL_ZOOM, MIN_ZOOM } from "./action/touchZoom";
   import { arrangeNewTerminal } from "./arrange";
   import { settings } from "./settings";
   import { EyeIcon } from "svelte-feather-icons";
@@ -47,6 +48,12 @@
   const TERM_MIN_ROWS = 8;
   const TERM_MIN_COLS = 32;
 
+  // The mobile single-session layout is enabled automatically on narrow or
+  // touch-primary devices.
+  const MOBILE_MEDIA_QUERY = "(max-width: 767px), (pointer: coarse)";
+  const MOBILE_FIT_PADDING = 10;
+  const MOBILE_MIN_ZOOM = 0.12;
+
   function getConstantOffset() {
     return [
       0.5 * window.innerWidth - CONSTANT_OFFSET_LEFT,
@@ -63,11 +70,28 @@
   let settingsOpen = false; // @hmr:keep
   let showNetworkInfo = false; // @hmr:keep
 
+  // Mobile single-session layout state.
+  let mobile = false;
+  let activeId: number | null = null;
+  let titles: Record<number, string> = {};
+  let pendingCreate = false;
+  let readyShells = new Set<number>();
+  let headerEl: HTMLDivElement;
+  let safeAreaBottom = 0;
+  let desktopView: { center: number[]; zoom: number } | null = null;
+  let fitRaf = 0;
+  let lastFitKey = "";
+  let lastFitActiveId: number | null = null;
+  let lastViewportWidth = 0;
+
   onMount(() => {
     touchZoom = new TouchZoom(fabricEl);
-    touchZoom.onMove(() => {
+    touchZoom.onMove((manual) => {
       center = touchZoom.center;
       zoom = touchZoom.zoom;
+
+      // Programmatic fits must not disturb an active terminal or hide panels.
+      if (!manual) return;
 
       // Blur if the user is currently focused on a terminal.
       //
@@ -82,7 +106,169 @@
 
       showNetworkInfo = false;
     });
+
+    // Automatically switch to the single-session layout on phones/tablets.
+    const query = window.matchMedia(MOBILE_MEDIA_QUERY);
+    setMobile(query.matches);
+    const onMediaChange = (event: MediaQueryListEvent) =>
+      setMobile(event.matches);
+    query.addEventListener("change", onMediaChange);
+
+    // Refit on orientation or window width changes, but ignore height-only
+    // changes (e.g. a soft keyboard opening) so the terminal does not shrink
+    // while the user is typing.
+    const onViewportResize = debounce(() => {
+      if (!mobile) return;
+      const width = window.innerWidth;
+      if (width === lastViewportWidth) return;
+      lastViewportWidth = width;
+      lastFitKey = "";
+      scheduleFit(false);
+    }, 150);
+    window.addEventListener("resize", onViewportResize);
+    window.addEventListener("orientationchange", onViewportResize);
+
+    // Refit when the top bar changes height (status banner, network info, ...).
+    const headerObserver = new ResizeObserver(() => {
+      if (mobile) scheduleFit(false);
+    });
+    if (headerEl) {
+      headerObserver.observe(headerEl);
+    }
+
+    return () => {
+      query.removeEventListener("change", onMediaChange);
+      window.removeEventListener("resize", onViewportResize);
+      window.removeEventListener("orientationchange", onViewportResize);
+      headerObserver.disconnect();
+    };
   });
+
+  function setMobile(next: boolean) {
+    if (next === mobile || !touchZoom) return;
+    if (next) {
+      desktopView = { center: [...center], zoom };
+      if (activeId === null && shells.length) {
+        activeId = shells[shells.length - 1][0];
+      }
+      mobile = true;
+      lastFitActiveId = null;
+      lastFitKey = "";
+      lastViewportWidth = window.innerWidth;
+      touchZoom.setMinZoom(MOBILE_MIN_ZOOM);
+    } else {
+      mobile = false;
+      lastFitKey = "";
+      lastFitActiveId = null;
+      touchZoom.setMinZoom(MIN_ZOOM);
+      if (desktopView) {
+        touchZoom.setView(desktopView.center, desktopView.zoom);
+        desktopView = null;
+      }
+    }
+  }
+
+  /** Move and zoom the camera so the active terminal fits the viewport. */
+  function fitActive(animated = false, forceReady = false) {
+    if (!mobile || activeId === null || !touchZoom) return;
+    if (!forceReady && !readyShells.has(activeId)) return;
+    if (touchZoom.isPinching) {
+      window.setTimeout(() => scheduleFit(animated), 250);
+      return;
+    }
+
+    const entry = shells.find(([sid]) => sid === activeId);
+    const el = termWrappers[activeId];
+    if (!entry || !el) return;
+    const [, ws] = entry;
+    const width = el.offsetWidth;
+    const height = el.offsetHeight;
+    if (width < 10 || height < 10) return;
+
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    const regionTop =
+      Math.max(headerEl?.getBoundingClientRect().bottom ?? 0, 0) +
+      MOBILE_FIT_PADDING;
+    const regionBottom = vh - safeAreaBottom - MOBILE_FIT_PADDING;
+    const availW = vw - 2 * MOBILE_FIT_PADDING;
+    const availH = regionBottom - regionTop;
+    if (availW <= 0 || availH <= 0) return;
+
+    const fittedZoom = Math.max(
+      MOBILE_MIN_ZOOM,
+      Math.min(1, availW / width, availH / height),
+    );
+
+    const [ox, oy] = getConstantOffset();
+    const cx = vw / 2;
+    const cy = (regionTop + regionBottom) / 2;
+    const nextCenter = [
+      ox + ws.x + width / 2 - cx / fittedZoom,
+      oy + ws.y + height / 2 - cy / fittedZoom,
+    ];
+
+    if (animated) {
+      touchZoom.moveTo(nextCenter, fittedZoom);
+    } else {
+      touchZoom.setView(nextCenter, fittedZoom);
+    }
+  }
+
+  function scheduleFit(animated = false) {
+    cancelAnimationFrame(fitRaf);
+    fitRaf = requestAnimationFrame(async () => {
+      await tick();
+      fitActive(animated);
+    });
+  }
+
+  function markReady(id: number) {
+    if (readyShells.has(id)) return;
+    if (mobile && id === activeId) {
+      // Fit while the wrapper is still hidden by the measuring gate.
+      fitActive(false, true);
+    }
+    readyShells = new Set(readyShells).add(id);
+  }
+
+  function watchShellSize(node: HTMLElement) {
+    sizeObserver ??= new ResizeObserver((entries) => {
+      const currentId = activeId;
+      if (!mobile || currentId === null) return;
+      if (entries.some((entry) => entry.target === termWrappers[currentId])) {
+        scheduleFit(false);
+      }
+    });
+    sizeObserver.observe(node);
+    return {
+      destroy() {
+        sizeObserver?.unobserve(node);
+      },
+    };
+  }
+
+  let sizeObserver: ResizeObserver;
+
+  function selectShell(id: number) {
+    if (id === activeId) return;
+    const activeElement = document.activeElement;
+    if (
+      activeElement instanceof HTMLElement &&
+      activeElement.closest(".term-container")
+    ) {
+      activeElement.blur();
+    }
+    focused = [];
+    activeId = id;
+    showNetworkInfo = false;
+  }
+
+  function closeShell(id: number) {
+    if (hasWriteAccess === true && connected) {
+      srocket?.send({ close: id });
+    }
+  }
 
   /** Returns the mouse position in infinite grid coordinates, offset transformations and zoom. */
   function normalizePosition(event: MouseEvent): [number, number] {
@@ -179,18 +365,7 @@
             users = [...users, [id, update]];
           }
         } else if (message.shells) {
-          shells = message.shells;
-          if (movingIsDone) {
-            moving = -1;
-          }
-          for (const [id] of message.shells) {
-            if (!subscriptions.has(id)) {
-              chunknums[id] ??= 0;
-              locks[id] ??= createLock();
-              subscriptions.add(id);
-              srocket?.send({ subscribe: [id, chunknums[id]] });
-            }
-          }
+          applyShells(message.shells);
         } else if (message.hear) {
           const [uid, name, msg] = message.hear;
           chatMessages.push({ uid, name, msg, sentAt: new Date() });
@@ -217,6 +392,7 @@
 
       onDisconnect() {
         connected = false;
+        pendingCreate = false;
         subscriptions.clear();
         users = [];
         serverLatencies = [];
@@ -260,6 +436,65 @@
     srocket?.send({ setName: $settings.name });
   }
 
+  /** Update the shell list, keeping the mobile active selection consistent. */
+  function applyShells(next: [number, WsWinsize][]) {
+    const prevIds = new Set(shells.map(([sid]) => sid));
+    const prevIndex = shells.findIndex(([sid]) => sid === activeId);
+    const added = next.filter(([sid]) => !prevIds.has(sid));
+
+    shells = next;
+    if (movingIsDone) {
+      moving = -1;
+    }
+    for (const [id] of next) {
+      if (!subscriptions.has(id)) {
+        chunknums[id] ??= 0;
+        locks[id] ??= createLock();
+        subscriptions.add(id);
+        srocket?.send({ subscribe: [id, chunknums[id]] });
+      }
+    }
+
+    if (!mobile) return;
+    if (pendingCreate && added.length) {
+      pendingCreate = false;
+      activeId = added[added.length - 1][0];
+    } else if (activeId === null || !next.some(([sid]) => sid === activeId)) {
+      activeId = next.length
+        ? next[Math.min(Math.max(prevIndex, 0), next.length - 1)][0]
+        : null;
+    }
+  }
+
+  // Fallbacks for shells arriving before the media query is evaluated, and
+  // for the active shell being closed or removed by someone else.
+  $: if (
+    mobile &&
+    shells.length > 0 &&
+    !shells.some(([sid]) => sid === activeId)
+  ) {
+    activeId = shells[shells.length - 1][0];
+  }
+  $: if (shells.length === 0 && activeId !== null) {
+    activeId = null;
+  }
+
+  // Animate the camera to a newly selected shell, and refit when its shared
+  // geometry changes (e.g. another user moves or resizes it).
+  $: if (mobile && activeId !== null) {
+    const ws = shells.find(([sid]) => sid === activeId)?.[1];
+    if (ws) {
+      const key = `${activeId}:${ws.x},${ws.y}:${ws.rows}x${ws.cols}`;
+      if (key !== lastFitKey) {
+        const animated =
+          lastFitActiveId !== null && activeId !== lastFitActiveId;
+        lastFitKey = key;
+        lastFitActiveId = activeId;
+        scheduleFit(animated);
+      }
+    }
+  }
+
   let counter = 0n;
 
   async function handleCreate() {
@@ -284,8 +519,13 @@
       height: termWrappers[id].clientHeight,
     }));
     const { x, y } = arrangeNewTerminal(existing);
+    if (mobile) {
+      pendingCreate = true;
+    }
     srocket?.send({ create: [x, y] });
-    touchZoom.moveTo([x, y], INITIAL_ZOOM);
+    if (!mobile) {
+      touchZoom.moveTo([x, y], INITIAL_ZOOM);
+    }
   }
 
   async function handleInput(id: number, data: Uint8Array) {
@@ -310,7 +550,19 @@
   });
 
   afterUpdate(() => {
-    if (activeElement instanceof HTMLElement) activeElement.focus();
+    if (!(activeElement instanceof HTMLElement)) return;
+    if (mobile) {
+      // Never restore focus to a terminal that is currently hidden, or to
+      // arbitrary controls affected by the tab re-render.
+      if (!activeElement.closest(".term-container")) return;
+      if (
+        activeId === null ||
+        !termWrappers[activeId]?.contains(activeElement)
+      ) {
+        return;
+      }
+    }
+    activeElement.focus();
   });
 
   // Global mouse handler logic follows, attached to the window element for smoothness.
@@ -392,14 +644,21 @@
 
 <!-- Wheel handler stops native macOS Chrome zooming on pinch. -->
 <main
-  class="p-8"
-  class:cursor-nwse-resize={resizing !== -1}
+  class={mobile ? "fixed inset-0 overflow-hidden p-0" : "p-8"}
+  class:cursor-nwse-resize={!mobile && resizing !== -1}
   on:wheel={(event) => event.preventDefault()}
 >
   <div
-    class="absolute top-8 inset-x-0 flex justify-center pointer-events-none z-10"
+    bind:this={headerEl}
+    class="absolute inset-x-0 z-20 flex flex-col items-center pointer-events-none {mobile
+      ? 'top-0'
+      : 'top-8'}"
+    style:padding-top={mobile
+      ? "calc(env(safe-area-inset-top) + 0.5rem)"
+      : undefined}
   >
     <Toolbar
+      {mobile}
       {connected}
       {newMessages}
       {hasWriteAccess}
@@ -413,11 +672,44 @@
       }}
       on:networkInfo={() => {
         showNetworkInfo = !showNetworkInfo;
+        if (mobile) scheduleFit(false);
       }}
     />
 
+    {#if mobile}
+      <div class="mt-1.5 w-full px-2">
+        <SessionTabs
+          {shells}
+          {activeId}
+          {titles}
+          {connected}
+          canCreate={connected && hasWriteAccess === true && shells.length < 14}
+          canClose={connected && hasWriteAccess === true}
+          on:select={({ detail }) => selectShell(detail)}
+          on:create={handleCreate}
+          on:close={({ detail }) => closeShell(detail)}
+        />
+      </div>
+      {#if !connected || hasWriteAccess === false || exitReason}
+        <div
+          class="panel mt-1 px-3 py-0.5 text-xs pointer-events-auto {exitReason
+            ? 'text-red-400'
+            : hasWriteAccess === false
+            ? 'text-yellow-200'
+            : 'text-yellow-400'}"
+        >
+          {exitReason ??
+            (hasWriteAccess === false ? "Read-only" : "Reconnecting…")}
+        </div>
+      {/if}
+    {/if}
+
     {#if showNetworkInfo}
-      <div class="absolute top-20 translate-x-[116.5px]">
+      <div
+        class={mobile
+          ? "mt-1 w-72 max-w-[calc(100vw-16px)] pointer-events-auto"
+          : "absolute top-20 translate-x-[116.5px]"}
+      >
         <NetworkInfo
           status={connected
             ? "connected"
@@ -431,9 +723,34 @@
     {/if}
   </div>
 
+  {#if mobile && shells.length === 0}
+    <div
+      class="absolute inset-0 z-10 flex items-center justify-center px-6 pointer-events-none"
+      style:padding-top="calc(env(safe-area-inset-top) + 6rem)"
+    >
+      <div
+        class="panel p-4 text-center text-sm text-zinc-300 pointer-events-auto"
+      >
+        {#if exitReason}
+          <span class="text-red-400">{exitReason}</span>
+        {:else if !connected}
+          Connecting…
+        {:else}
+          No terminals yet.
+          {#if hasWriteAccess === true}
+            <br />Tap + to create one.
+          {/if}
+        {/if}
+      </div>
+    </div>
+  {/if}
+
   {#if showChat}
     <div
-      class="absolute flex flex-col justify-end inset-y-4 right-4 w-80 pointer-events-none z-10"
+      class="absolute flex flex-col justify-end pointer-events-none z-10 {mobile
+        ? 'inset-y-2 left-2 right-2'
+        : 'inset-y-4 right-4 w-80'}"
+      style:padding-bottom={mobile ? "env(safe-area-inset-bottom)" : undefined}
     >
       <Chat
         {userId}
@@ -452,54 +769,74 @@
     Dotted circle background appears underneath the rest of the elements, but
     moves and zooms with the fabric of the canvas.
   -->
-  <div
-    class="absolute inset-0 -z-10"
-    style:background-image="radial-gradient(#333 {zoom}px, transparent 0)"
-    style:background-size="{24 * zoom}px {24 * zoom}px"
-    style:background-position="{-zoom * center[0]}px {-zoom * center[1]}px"
-  />
+  {#if !mobile}
+    <div
+      class="absolute inset-0 -z-10"
+      style:background-image="radial-gradient(#333 {zoom}px, transparent 0)"
+      style:background-size="{24 * zoom}px {24 * zoom}px"
+      style:background-position="{-zoom * center[0]}px {-zoom * center[1]}px"
+    />
+  {/if}
 
-  <div class="py-2">
-    {#if exitReason !== null}
-      <div class="text-red-400">{exitReason}</div>
-    {:else if connected}
-      <div class="flex items-center">
-        <div class="text-green-400">You are connected!</div>
-        {#if userId && hasWriteAccess === false}
-          <div
-            class="bg-yellow-900 text-yellow-200 px-1 py-0.5 rounded ml-3 inline-flex items-center gap-1"
-          >
-            <EyeIcon size="14" />
-            <span class="text-xs">Read-only</span>
-          </div>
-        {/if}
+  {#if !mobile}
+    <div class="py-2">
+      {#if exitReason !== null}
+        <div class="text-red-400">{exitReason}</div>
+      {:else if connected}
+        <div class="flex items-center">
+          <div class="text-green-400">You are connected!</div>
+          {#if userId && hasWriteAccess === false}
+            <div
+              class="bg-yellow-900 text-yellow-200 px-1 py-0.5 rounded ml-3 inline-flex items-center gap-1"
+            >
+              <EyeIcon size="14" />
+              <span class="text-xs">Read-only</span>
+            </div>
+          {/if}
+        </div>
+      {:else}
+        <div class="text-yellow-400">Connecting…</div>
+      {/if}
+
+      <div class="mt-4">
+        <NameList {users} />
       </div>
-    {:else}
-      <div class="text-yellow-400">Connecting…</div>
-    {/if}
-
-    <div class="mt-4">
-      <NameList {users} />
     </div>
-  </div>
+  {/if}
+
+  <!-- Bottom safe-area probe for fitting the terminal above the home indicator. -->
+  <div
+    class="pointer-events-none fixed bottom-0 left-0 w-px"
+    style:height="env(safe-area-inset-bottom, 0px)"
+    bind:clientHeight={safeAreaBottom}
+  />
 
   <div class="absolute inset-0 overflow-hidden touch-none" bind:this={fabricEl}>
     {#each shells as [id, winsize] (id)}
       {@const ws = id === moving ? movingSize : winsize}
       <div
         class="absolute"
+        class:measuring={!readyShells.has(id)}
+        class:invisible={mobile && id !== activeId}
+        class:pointer-events-none={mobile && id !== activeId}
+        aria-hidden={mobile && id !== activeId}
         style:left={OFFSET_LEFT_CSS}
         style:top={OFFSET_TOP_CSS}
         style:transform-origin={OFFSET_TRANSFORM_ORIGIN_CSS}
+        use:watchShellSize
         transition:fade|local
         use:slide={{ x: ws.x, y: ws.y, center, zoom, immediate: id === moving }}
         bind:this={termWrappers[id]}
       >
         <XTerm
+          {mobile}
           rows={ws.rows}
           cols={ws.cols}
           bind:write={writers[id]}
           bind:termEl={termElements[id]}
+          on:titleChange={({ detail }) =>
+            (titles = { ...titles, [id]: detail })}
+          on:ready={() => markReady(id)}
           on:data={({ detail: data }) =>
             hasWriteAccess && handleInput(id, data)}
           on:close={() => srocket?.send({ close: id })}
@@ -518,12 +855,12 @@
             srocket?.send({ move: [id, { ...ws, rows, cols }] });
           }}
           on:bringToFront={() => {
-            if (!hasWriteAccess) return;
+            if (!hasWriteAccess || mobile) return;
             showNetworkInfo = false;
             srocket?.send({ move: [id, null] });
           }}
           on:startMove={({ detail: event }) => {
-            if (!hasWriteAccess) return;
+            if (!hasWriteAccess || mobile) return;
             const [x, y] = normalizePosition(event);
             moving = id;
             movingOrigin = [x - ws.x, y - ws.y];
@@ -539,49 +876,71 @@
           }}
         />
 
-        <!-- User avatars -->
-        <div class="absolute bottom-2.5 right-2.5 pointer-events-none">
-          <Avatars
-            users={users.filter(
-              ([uid, user]) => uid !== userId && user.focus === id,
-            )}
+        {#if !mobile}
+          <!-- User avatars -->
+          <div class="absolute bottom-2.5 right-2.5 pointer-events-none">
+            <Avatars
+              users={users.filter(
+                ([uid, user]) => uid !== userId && user.focus === id,
+              )}
+            />
+          </div>
+
+          <!-- Interactable element for resizing -->
+          <div
+            class="absolute w-5 h-5 -bottom-1 -right-1 cursor-nwse-resize"
+            on:mousedown={(event) => {
+              const canvasEl = termElements[id].querySelector(".xterm-screen");
+              if (canvasEl) {
+                resizing = id;
+                const r = canvasEl.getBoundingClientRect();
+                resizingOrigin = [
+                  event.pageX - r.width,
+                  event.pageY - r.height,
+                ];
+                resizingCell = [r.width / ws.cols, r.height / ws.rows];
+                resizingSize = ws;
+              }
+            }}
+            on:pointerdown={(event) => event.stopPropagation()}
           />
-        </div>
+        {/if}
+      </div>
+    {/each}
 
-        <!-- Interactable element for resizing -->
+    {#if !mobile}
+      {#each users.filter(([id, user]) => id !== userId && user.cursor !== null) as [id, user] (id)}
         <div
-          class="absolute w-5 h-5 -bottom-1 -right-1 cursor-nwse-resize"
-          on:mousedown={(event) => {
-            const canvasEl = termElements[id].querySelector(".xterm-screen");
-            if (canvasEl) {
-              resizing = id;
-              const r = canvasEl.getBoundingClientRect();
-              resizingOrigin = [event.pageX - r.width, event.pageY - r.height];
-              resizingCell = [r.width / ws.cols, r.height / ws.rows];
-              resizingSize = ws;
-            }
+          class="absolute"
+          style:left={OFFSET_LEFT_CSS}
+          style:top={OFFSET_TOP_CSS}
+          style:transform-origin={OFFSET_TRANSFORM_ORIGIN_CSS}
+          transition:fade|local={{ duration: 200 }}
+          use:slide={{
+            x: user.cursor?.[0] ?? 0,
+            y: user.cursor?.[1] ?? 0,
+            center,
+            zoom,
           }}
-          on:pointerdown={(event) => event.stopPropagation()}
-        />
-      </div>
-    {/each}
-
-    {#each users.filter(([id, user]) => id !== userId && user.cursor !== null) as [id, user] (id)}
-      <div
-        class="absolute"
-        style:left={OFFSET_LEFT_CSS}
-        style:top={OFFSET_TOP_CSS}
-        style:transform-origin={OFFSET_TRANSFORM_ORIGIN_CSS}
-        transition:fade|local={{ duration: 200 }}
-        use:slide={{
-          x: user.cursor?.[0] ?? 0,
-          y: user.cursor?.[1] ?? 0,
-          center,
-          zoom,
-        }}
-      >
-        <LiveCursor {user} />
-      </div>
-    {/each}
+        >
+          <LiveCursor {user} />
+        </div>
+      {/each}
+    {/if}
   </div>
 </main>
+
+<style lang="postcss">
+  /*
+   * Hide a terminal until xterm has measured its font and called resize().
+   *
+   * xterm measures character size with getBoundingClientRect(), which is
+   * affected by the canvas transform. Rendering at identity scale (while
+   * hidden) prevents terminals created at a zoomed-out camera from measuring
+   * tiny character cells and rendering incorrectly.
+   */
+  .measuring {
+    transform: none !important;
+    visibility: hidden !important;
+  }
+</style>

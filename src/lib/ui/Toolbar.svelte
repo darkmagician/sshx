@@ -12,6 +12,7 @@
   export let connected: boolean;
   export let hasWriteAccess: boolean | undefined;
   export let newMessages: boolean;
+  export let mobile = false;
 
   const dispatch = createEventDispatcher<{
     create: void;
@@ -21,14 +22,16 @@
   }>();
 </script>
 
-<div class="panel inline-block px-3 py-2">
+<div class="panel inline-block {mobile ? 'px-2 py-1.5' : 'px-3 py-2'}">
   <div class="flex items-center select-none">
     <a href="/" class="flex-shrink-0"
-      ><img src={logo} alt="sshx logo" class="h-10" /></a
+      ><img src={logo} alt="sshx logo" class={mobile ? "h-8" : "h-10"} /></a
     >
-    <p class="ml-1.5 mr-2 font-medium">sshx</p>
+    {#if !mobile}
+      <p class="ml-1.5 mr-2 font-medium">sshx</p>
+    {/if}
 
-    <div class="v-divider" />
+    <div class="v-divider" class:compact={mobile} />
 
     <div class="flex space-x-1">
       <button
@@ -54,7 +57,7 @@
       </button>
     </div>
 
-    <div class="v-divider" />
+    <div class="v-divider" class:compact={mobile} />
 
     <div class="flex space-x-1">
       <button class="icon-button" on:click={() => dispatch("networkInfo")}>
@@ -67,6 +70,10 @@
 <style lang="postcss">
   .v-divider {
     @apply h-5 mx-2 border-l-4 border-zinc-800;
+  }
+
+  .v-divider.compact {
+    @apply mx-1.5;
   }
 
   .icon-button {

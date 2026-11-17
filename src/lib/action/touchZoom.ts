@@ -49,7 +49,8 @@ function debounce<T extends (...args: any[]) => void>(fn: T, ms = 0) {
   };
 }
 
-const MIN_ZOOM = 0.35;
+export const MIN_ZOOM = 0.35;
+const HARD_MIN_ZOOM = 0.05;
 const MAX_ZOOM = 2;
 export const INITIAL_ZOOM = 1.0;
 
@@ -71,6 +72,8 @@ export class TouchZoom {
   #delta: number[] = [0, 0];
   #lastMovement = 1;
   #wheelLastTimeStamp = 0;
+  #minZoom = MIN_ZOOM;
+  #animation = 0;
 
   #callbacks = new Set<(manual: boolean) => void>();
 
@@ -113,7 +116,7 @@ export class TouchZoom {
         pinch: {
           from: [this.zoom, 0],
           scaleBounds: () => {
-            return { from: this.zoom, max: MAX_ZOOM, min: MIN_ZOOM };
+            return { from: this.zoom, max: MAX_ZOOM, min: this.#minZoom };
           },
         },
         drag: {
@@ -150,7 +153,23 @@ export class TouchZoom {
     return () => this.#callbacks.delete(callback);
   }
 
+  /** Set the minimum zoom level reachable by pinch and wheel gestures. */
+  setMinZoom(minZoom: number) {
+    this.#minZoom = Vec.clamp(minZoom, HARD_MIN_ZOOM, MAX_ZOOM);
+  }
+
+  /** Jump the camera to a position without animating, cancelling any in-flight moveTo. */
+  setView(pos: number[], zoom: number) {
+    this.#animation++;
+    this.center = [...pos];
+    this.zoom = Vec.clamp(zoom, this.#minZoom, MAX_ZOOM);
+    this.#moved(false);
+  }
+
   async moveTo(pos: number[], zoom: number) {
+    // Cancel any previous animation and mark this one as current.
+    const token = ++this.#animation;
+
     // Cubic bezier easing
     const smoothstep = (z: number) => {
       const x = Math.max(0, Math.min(1, z));
@@ -164,6 +183,9 @@ export class TouchZoom {
     const startZ = 1 / this.zoom;
     const finishZ = 1 / zoom;
     while (true) {
+      // A user gesture or a newer animation has taken over.
+      if (token !== this.#animation) return;
+
       const t = Date.now() - beginTime;
       if (t > totalTime) break;
       const k = smoothstep(t / totalTime);
@@ -173,8 +195,9 @@ export class TouchZoom {
       this.#moved(false);
       await new Promise((resolve) => requestAnimationFrame(resolve));
     }
+    if (token !== this.#animation) return;
     this.center = pos;
-    this.zoom = zoom;
+    this.zoom = Vec.clamp(zoom, this.#minZoom, MAX_ZOOM);
     this.#moved(false);
   }
 
@@ -189,6 +212,7 @@ export class TouchZoom {
     if (this.isPinching || e.timeStamp <= this.#wheelLastTimeStamp) return;
 
     this.#wheelLastTimeStamp = e.timeStamp;
+    this.#animation++;
 
     const [x, y, z] = normalizeWheel(e);
 
@@ -201,7 +225,7 @@ export class TouchZoom {
       const delta = z * 0.618;
 
       let newZoom = (1 - delta / 320) * this.zoom;
-      newZoom = Vec.clamp(newZoom, MIN_ZOOM, MAX_ZOOM);
+      newZoom = Vec.clamp(newZoom, this.#minZoom, MAX_ZOOM);
 
       const offset = Vec.sub(point, [0, 0]);
       const movement = Vec.mul(offset, 1 / this.zoom - 1 / newZoom);
@@ -234,6 +258,7 @@ export class TouchZoom {
   > = ({ origin, event }) => {
     if (event instanceof WheelEvent) return;
 
+    this.#animation++;
     this.isPinching = true;
     this.#originPoint = origin;
     this.#delta = [0, 0];
@@ -256,7 +281,7 @@ export class TouchZoom {
     this.#lastMovement = movement[0];
 
     this.center = Vec.add(this.center, Vec.div(trueDelta, this.zoom * 2));
-    this.zoom = Vec.clamp(this.zoom * zoomLevel, MIN_ZOOM, MAX_ZOOM);
+    this.zoom = Vec.clamp(this.zoom * zoomLevel, this.#minZoom, MAX_ZOOM);
     this.#moved();
   };
 
@@ -276,6 +301,7 @@ export class TouchZoom {
     MouseEvent | PointerEvent | TouchEvent | KeyboardEvent
   > = ({ delta, elapsedTime }) => {
     if (delta[0] === 0 && delta[1] === 0 && elapsedTime < 200) return;
+    this.#animation++;
     this.center = Vec.sub(this.center, Vec.div(delta, this.zoom));
     this.#moved();
   };

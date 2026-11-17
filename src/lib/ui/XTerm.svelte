@@ -57,12 +57,17 @@
     startMove: MouseEvent;
     focus: void;
     blur: void;
+    titleChange: string;
+    ready: void;
   }>();
 
   const typeahead = new TypeAheadAddon();
 
   export let rows: number, cols: number;
   export let write: (data: string) => void; // bound function prop
+
+  /** Whether this terminal is shown in the mobile single-session layout. */
+  export let mobile = false;
 
   export let termEl: HTMLDivElement = null as any; // suppress "missing prop" warning
   let term: Terminal | null = null;
@@ -172,6 +177,7 @@
     term.resize(cols, rows);
     term.onTitleChange((title) => {
       currentTitle = title;
+      dispatch("titleChange", title);
     });
 
     // Hack: We artificially disable scrolling when the terminal is not focused.
@@ -209,6 +215,10 @@
     term.onBinary((data: string) => {
       dispatch("data", Buffer.from(data, "binary"));
     });
+
+    // Let the parent know that the terminal has real dimensions now, so that
+    // it can measure and fit the mobile viewport before revealing it.
+    dispatch("ready");
   });
 
   onDestroy(() => term?.dispose());
@@ -218,40 +228,42 @@
   class="term-container"
   class:focused
   style:background={theme.background}
-  on:mousedown={() => dispatch("bringToFront")}
+  on:mousedown={() => !mobile && dispatch("bringToFront")}
   on:pointerdown={(event) => event.stopPropagation()}
 >
-  <div
-    class="flex select-none"
-    on:mousedown={(event) => dispatch("startMove", event)}
-  >
-    <div class="flex-1 flex items-center px-3">
-      <CircleButtons>
-        <!--
-          TODO: This should be on:click, but that is not working due to the
-          containing element's on:pointerdown `stopPropagation()` call.
-        -->
-        <CircleButton
-          kind="red"
-          on:mousedown={(event) => event.button === 0 && dispatch("close")}
-        />
-        <CircleButton
-          kind="yellow"
-          on:mousedown={(event) => event.button === 0 && dispatch("shrink")}
-        />
-        <CircleButton
-          kind="green"
-          on:mousedown={(event) => event.button === 0 && dispatch("expand")}
-        />
-      </CircleButtons>
-    </div>
+  {#if !mobile}
     <div
-      class="p-2 text-sm text-zinc-300 text-center font-medium overflow-hidden whitespace-nowrap text-ellipsis w-0 flex-grow-[4]"
+      class="flex select-none"
+      on:mousedown={(event) => dispatch("startMove", event)}
     >
-      {currentTitle}
+      <div class="flex-1 flex items-center px-3">
+        <CircleButtons>
+          <!--
+            TODO: This should be on:click, but that is not working due to the
+            containing element's on:pointerdown `stopPropagation()` call.
+          -->
+          <CircleButton
+            kind="red"
+            on:mousedown={(event) => event.button === 0 && dispatch("close")}
+          />
+          <CircleButton
+            kind="yellow"
+            on:mousedown={(event) => event.button === 0 && dispatch("shrink")}
+          />
+          <CircleButton
+            kind="green"
+            on:mousedown={(event) => event.button === 0 && dispatch("expand")}
+          />
+        </CircleButtons>
+      </div>
+      <div
+        class="p-2 text-sm text-zinc-300 text-center font-medium overflow-hidden whitespace-nowrap text-ellipsis w-0 flex-grow-[4]"
+      >
+        {currentTitle}
+      </div>
+      <div class="flex-1" />
     </div>
-    <div class="flex-1" />
-  </div>
+  {/if}
   <div
     class="inline-block px-4 py-2 transition-opacity duration-500"
     bind:this={termEl}
