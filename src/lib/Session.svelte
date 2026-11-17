@@ -80,9 +80,9 @@
   let safeAreaBottom = 0;
   let desktopView: { center: number[]; zoom: number } | null = null;
   let fitRaf = 0;
+  let resizeSendTimer: number | undefined;
   let lastFitKey = "";
   let lastFitActiveId: number | null = null;
-  let lastViewportWidth = 0;
 
   onMount(() => {
     touchZoom = new TouchZoom(fabricEl);
@@ -114,19 +114,16 @@
       setMobile(event.matches);
     query.addEventListener("change", onMediaChange);
 
-    // Refit on orientation or window width changes, but ignore height-only
-    // changes (e.g. a soft keyboard opening) so the terminal does not shrink
-    // while the user is typing.
+    // Refit and reflow the terminal when the visible viewport changes:
+    // orientation changes, window resizes, and the soft keyboard opening or
+    // closing (visualViewport shrinks by the keyboard height).
     const onViewportResize = debounce(() => {
-      if (!mobile) return;
-      const width = window.innerWidth;
-      if (width === lastViewportWidth) return;
-      lastViewportWidth = width;
-      lastFitKey = "";
-      scheduleFit(false);
+      if (mobile) scheduleFit(false);
     }, 150);
     window.addEventListener("resize", onViewportResize);
     window.addEventListener("orientationchange", onViewportResize);
+    window.visualViewport?.addEventListener("resize", onViewportResize);
+    window.visualViewport?.addEventListener("scroll", onViewportResize);
 
     // Refit when the top bar changes height (status banner, network info, ...).
     const headerObserver = new ResizeObserver(() => {
@@ -140,6 +137,8 @@
       query.removeEventListener("change", onMediaChange);
       window.removeEventListener("resize", onViewportResize);
       window.removeEventListener("orientationchange", onViewportResize);
+      window.visualViewport?.removeEventListener("resize", onViewportResize);
+      window.visualViewport?.removeEventListener("scroll", onViewportResize);
       headerObserver.disconnect();
     };
   });
@@ -154,7 +153,6 @@
       mobile = true;
       lastFitActiveId = null;
       lastFitKey = "";
-      lastViewportWidth = window.innerWidth;
       touchZoom.setMinZoom(MOBILE_MIN_ZOOM);
     } else {
       mobile = false;
@@ -166,6 +164,90 @@
         desktopView = null;
       }
     }
+  }
+
+  /**
+   * The visible area available to the active terminal, accounting for the top
+   * bar, the home indicator, and the soft keyboard (via visualViewport).
+   */
+  function getMobileRegion() {
+    const vv = window.visualViewport;
+    const offsetLeft = vv?.offsetLeft ?? 0;
+    const offsetTop = vv?.offsetTop ?? 0;
+    const vw = vv?.width ?? window.innerWidth;
+    const vh = vv?.height ?? window.innerHeight;
+    const headerBottom = headerEl?.getBoundingClientRect().bottom ?? 0;
+    return {
+      left: offsetLeft + MOBILE_FIT_PADDING,
+      right: offsetLeft + vw - MOBILE_FIT_PADDING,
+      top: Math.max(headerBottom, offsetTop) + MOBILE_FIT_PADDING,
+      bottom: offsetTop + vh - safeAreaBottom - MOBILE_FIT_PADDING,
+    };
+  }
+
+  /**
+   * Compute terminal dimensions that make the active terminal fill the mobile
+   * viewport. Cell metrics are derived from the live xterm screen, which is
+   * unaffected by the canvas transform.
+   */
+  function computeMobileTarget(id: number) {
+    const entry = shells.find(([sid]) => sid === id);
+    const wrapper = termWrappers[id];
+    const termEl = termElements[id];
+    if (!entry || !wrapper || !termEl) return null;
+    const ws = entry[1];
+    const screenEl = termEl.querySelector(
+      ".xterm-screen",
+    ) as HTMLElement | null;
+    if (!screenEl || !ws.cols || !ws.rows) return null;
+
+    const screenW = screenEl.offsetWidth;
+    const screenH = screenEl.offsetHeight;
+    if (screenW < 10 || screenH < 10) return null;
+
+    const cellW = screenW / ws.cols;
+    const cellH = screenH / ws.rows;
+    const chromeW = wrapper.offsetWidth - screenW;
+    const chromeH = wrapper.offsetHeight - screenH;
+    const region = getMobileRegion();
+    const availW = region.right - region.left - chromeW;
+    const availH = region.bottom - region.top - chromeH;
+    if (availW <= 0 || availH <= 0) return null;
+
+    return {
+      cols: Math.max(TERM_MIN_COLS, Math.floor(availW / cellW)),
+      rows: Math.max(TERM_MIN_ROWS, Math.floor(availH / cellH)),
+    };
+  }
+
+  /**
+   * Let the phone own the (shared) terminal size: resize the active PTY so it
+   * fills the visible screen. Debounced so that a collaborator dragging a
+   * window does not cause a resize message per frame.
+   */
+  function syncMobileSize() {
+    if (!mobile || activeId === null || hasWriteAccess !== true) return;
+    const target = computeMobileTarget(activeId);
+    const entry = shells.find(([sid]) => sid === activeId);
+    if (!target || !entry) return;
+    const ws = entry[1];
+    if (target.rows === ws.rows && target.cols === ws.cols) return;
+
+    const id = activeId;
+    window.clearTimeout(resizeSendTimer);
+    resizeSendTimer = window.setTimeout(() => {
+      if (!mobile || activeId !== id) return;
+      const current = shells.find(([sid]) => sid === id)?.[1];
+      if (
+        !current ||
+        (current.rows === target.rows && current.cols === target.cols)
+      ) {
+        return;
+      }
+      srocket?.send({
+        move: [id, { ...current, rows: target.rows, cols: target.cols }],
+      });
+    }, 150);
   }
 
   /** Move and zoom the camera so the active terminal fits the viewport. */
@@ -185,14 +267,9 @@
     const height = el.offsetHeight;
     if (width < 10 || height < 10) return;
 
-    const vw = window.innerWidth;
-    const vh = window.innerHeight;
-    const regionTop =
-      Math.max(headerEl?.getBoundingClientRect().bottom ?? 0, 0) +
-      MOBILE_FIT_PADDING;
-    const regionBottom = vh - safeAreaBottom - MOBILE_FIT_PADDING;
-    const availW = vw - 2 * MOBILE_FIT_PADDING;
-    const availH = regionBottom - regionTop;
+    const region = getMobileRegion();
+    const availW = region.right - region.left;
+    const availH = region.bottom - region.top;
     if (availW <= 0 || availH <= 0) return;
 
     const fittedZoom = Math.max(
@@ -201,8 +278,8 @@
     );
 
     const [ox, oy] = getConstantOffset();
-    const cx = vw / 2;
-    const cy = (regionTop + regionBottom) / 2;
+    const cx = (region.left + region.right) / 2;
+    const cy = (region.top + region.bottom) / 2;
     const nextCenter = [
       ox + ws.x + width / 2 - cx / fittedZoom,
       oy + ws.y + height / 2 - cy / fittedZoom,
@@ -219,6 +296,9 @@
     cancelAnimationFrame(fitRaf);
     fitRaf = requestAnimationFrame(async () => {
       await tick();
+      // Reflow the PTY first when we own the terminal size; the resulting
+      // shells update schedules another fit with the new dimensions.
+      syncMobileSize();
       fitActive(animated);
     });
   }
@@ -230,6 +310,10 @@
       fitActive(false, true);
     }
     readyShells = new Set(readyShells).add(id);
+    if (mobile && id === activeId) {
+      // Reflow now that the terminal has real dimensions.
+      scheduleFit(false);
+    }
   }
 
   function watchShellSize(node: HTMLElement) {
@@ -409,7 +493,13 @@
     });
   });
 
-  onDestroy(() => srocket?.dispose());
+  onDestroy(() => {
+    srocket?.dispose();
+    if (typeof window !== "undefined") {
+      window.clearTimeout(resizeSendTimer);
+      cancelAnimationFrame(fitRaf);
+    }
+  });
 
   // Send periodic ping messages for latency estimation.
   onMount(() => {
@@ -484,7 +574,9 @@
   $: if (mobile && activeId !== null) {
     const ws = shells.find(([sid]) => sid === activeId)?.[1];
     if (ws) {
-      const key = `${activeId}:${ws.x},${ws.y}:${ws.rows}x${ws.cols}`;
+      const key = `${activeId}:${ws.x},${ws.y}:${ws.rows}x${ws.cols}:${
+        hasWriteAccess === true
+      }`;
       if (key !== lastFitKey) {
         const animated =
           lastFitActiveId !== null && activeId !== lastFitActiveId;
