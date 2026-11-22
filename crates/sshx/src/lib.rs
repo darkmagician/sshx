@@ -6,6 +6,7 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod callback;
 pub mod controller;
 pub mod encrypt;
 pub mod runner;

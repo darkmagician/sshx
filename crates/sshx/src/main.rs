@@ -3,7 +3,7 @@ use std::process::ExitCode;
 use ansi_term::Color::{Cyan, Fixed, Green};
 use anyhow::Result;
 use clap::Parser;
-use sshx::{controller::Controller, runner::Runner, terminal::get_default_shell};
+use sshx::{callback, controller::Controller, runner::Runner, terminal::get_default_shell};
 use tokio::signal;
 use tracing::error;
 
@@ -31,6 +31,11 @@ struct Args {
     /// editors.
     #[clap(long)]
     enable_readers: bool,
+
+    /// Command to run once the session is shared. The shareable URL is passed
+    /// in the SSHX_URL environment variable.
+    #[clap(long, value_name = "COMMAND")]
+    callback: Option<String>,
 }
 
 fn print_greeting(shell: &str, controller: &Controller) {
@@ -101,12 +106,27 @@ async fn start(args: Args) -> Result<()> {
         print_greeting(&shell, &controller);
     }
 
+    // Fire the callback exactly once, after `open()` succeeded. The reconnect
+    // loop inside `controller.run()` starts after this point, so it never runs
+    // the callback again.
+    let callback_task = args
+        .callback
+        .as_deref()
+        .and_then(|command| callback::spawn(command, controller.url()));
+
     let exit_signal = signal::ctrl_c();
     tokio::pin!(exit_signal);
     tokio::select! {
         _ = controller.run() => unreachable!(),
         Ok(()) = &mut exit_signal => (),
-    };
+    }
+    if let Some(task) = callback_task {
+        // Do not block shutdown on the callback. Aborting and awaiting it
+        // ensures the task is dropped before the runtime shuts down, so that
+        // `kill_on_drop` terminates the child shell deterministically.
+        task.abort();
+        let _ = task.await;
+    }
     controller.close().await?;
 
     Ok(())

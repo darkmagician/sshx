@@ -67,6 +67,15 @@ jobs:
       #        should take under a second.
 ```
 
+Use `--callback` to run a command in the background once the session has been
+created. It runs through the system shell (`sh -c` on Unix, `cmd /S /C` on
+Windows), and the full shareable URL is available in the `SSHX_URL` environment
+variable:
+
+```shell
+sshx --callback 'curl -sSd "url=$SSHX_URL" https://example.com/hook'
+```
+
 We don't have a prepackaged action because it's just a single command. It works
 anywhere: GitLab CI, CircleCI, Buildkite, CI on your Raspberry Pi, etc.
 
